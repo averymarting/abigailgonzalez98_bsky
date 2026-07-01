@@ -3,6 +3,7 @@ import json
 import os
 import random
 import socket
+import sys
 import time
 import uuid
 from googleapiclient.discovery import build
@@ -156,8 +157,8 @@ def print_target_account(handle):
 # handle writes a row.
 FOLLOWER_SHEET_ID = "1d1ua2bzBt94omZxYgfwZhSJ94PJwAzc6clWpSVumebw"
 FOLLOWER_SHEET_TAB = "Sheet1"
-FOLLOWER_SHEET_RANGE = f"{FOLLOWER_SHEET_TAB}!A:E"
-FOLLOWER_SHEET_HEADER = ["Date (UTC)", "Handle", "Previous Followers", "Followers Added", "Total Followers"]
+FOLLOWER_SHEET_RANGE = f"{FOLLOWER_SHEET_TAB}!A:F"
+FOLLOWER_SHEET_HEADER = ["Date (UTC)", "Handle", "Previous Followers", "Followers Added", "Total Followers", "Status"]
 
 
 def get_sheets_service():
@@ -172,12 +173,12 @@ def get_sheets_service():
 def ensure_follower_sheet_header(service):
     """Write the header row if the sheet/tab is currently empty."""
     result = service.spreadsheets().values().get(
-        spreadsheetId=FOLLOWER_SHEET_ID, range=f"{FOLLOWER_SHEET_TAB}!A1:E1"
+        spreadsheetId=FOLLOWER_SHEET_ID, range=f"{FOLLOWER_SHEET_TAB}!A1:F1"
     ).execute()
     if not result.get("values"):
         service.spreadsheets().values().update(
             spreadsheetId=FOLLOWER_SHEET_ID,
-            range=f"{FOLLOWER_SHEET_TAB}!A1:E1",
+            range=f"{FOLLOWER_SHEET_TAB}!A1:F1",
             valueInputOption="RAW",
             body={"values": [FOLLOWER_SHEET_HEADER]},
         ).execute()
@@ -185,41 +186,64 @@ def ensure_follower_sheet_header(service):
 
 
 def get_last_follower_row(service, handle):
-    """Return the most recent [date, handle, previous, added, total] row for
-    this handle, or None if the handle has never been logged before."""
+    """Return the most recent row for this handle, or None if never logged."""
     result = service.spreadsheets().values().get(
         spreadsheetId=FOLLOWER_SHEET_ID, range=FOLLOWER_SHEET_RANGE
     ).execute()
     rows = result.get("values", [])
     last_row = None
     for row in rows[1:]:  # skip header
-        if len(row) >= 5 and row[1] == handle:
+        if len(row) >= 2 and row[1] == handle:
             last_row = row
     return last_row
 
 
-def append_follower_row(service, date_str, handle, previous, added, total):
+def append_follower_row(service, date_str, handle, previous, added, total, status="Active"):
     service.spreadsheets().values().append(
         spreadsheetId=FOLLOWER_SHEET_ID,
         range=FOLLOWER_SHEET_RANGE,
         valueInputOption="RAW",
         insertDataOption="INSERT_ROWS",
-        body={"values": [[date_str, handle, previous, added, total]]},
+        body={"values": [[date_str, handle, previous, added, total, status]]},
     ).execute()
+
+
+# ── Account takedown handling ────────────────────────────────────────────
+
+class AccountTakenDownError(Exception):
+    """Raised when Bluesky returns AccountTakedown for this handle.
+    Signals that the workflow should stop immediately — no point looping."""
+
+
+def log_account_ban_to_sheet(handle):
+    """Write a BANNED row to the follower report sheet so there's a clear
+    record of when the account was detected as taken down. Called before
+    exiting so the sheet always shows the last known status."""
+    today_str = time.strftime("%Y-%m-%d", time.gmtime())
+    try:
+        service = get_sheets_service()
+        ensure_follower_sheet_header(service)
+        last_row = get_last_follower_row(service, handle)
+        # Carry forward the last known total so the row is still useful.
+        last_total = int(last_row[4]) if last_row and len(last_row) >= 5 else 0
+        append_follower_row(
+            service, today_str, handle,
+            previous=last_total, added=0, total=last_total,
+            status="⛔ ACCOUNT TAKEN DOWN / BANNED",
+        )
+        print(f"Logged account ban for {handle} to report sheet.")
+    except Exception as e:
+        print(f"Warning: could not log ban to sheet: {e}")
 
 
 def maybe_generate_daily_follower_report(client, handle):
     """
     Once per UTC calendar day per handle: look up the account's current
-    follower count via the already-logged-in Bluesky client, compare it to
-    the last total we logged for this handle, and append one summary row to
-    the shared Google Sheet (previous total, followers gained, new total).
+    follower count, compare it to the last total logged for this handle,
+    and append one summary row to the shared Google Sheet.
 
-    Safe to call on every cycle/run — it checks the sheet first and no-ops
-    if today's row for this handle already exists, so multiple workflow
-    restarts within the same day only ever produce one row per handle.
-    Designed to support multiple accounts/handles all appending to the same
-    sheet over time.
+    Safe to call every cycle — it checks the sheet first and no-ops if
+    today's row for this handle already exists.
     """
     today_str = time.strftime("%Y-%m-%d", time.gmtime())
     try:
@@ -233,10 +257,10 @@ def maybe_generate_daily_follower_report(client, handle):
 
         profile = client.get_profile(actor=handle)
         total_followers = profile.followers_count or 0
-        previous_total = int(last_row[4]) if last_row else total_followers
+        previous_total = int(last_row[4]) if last_row and len(last_row) >= 5 else total_followers
         added = total_followers - previous_total
 
-        append_follower_row(service, today_str, handle, previous_total, added, total_followers)
+        append_follower_row(service, today_str, handle, previous_total, added, total_followers, status="Active")
         print(
             f"Logged daily follower report for {handle}: "
             f"previous={previous_total}, added={added:+d}, total={total_followers}"
@@ -635,20 +659,26 @@ def run_once():
       1. image vs video, per IMAGE_RATIO/VIDEO_RATIO
       2. with-link vs no-link, per NO_LINK_RATIO
 
-    We log into Bluesky once at the top of the cycle (rather than inside the
-    posting step) so the account handle gets printed and the daily follower
-    report can run even on cycles where there's no new media to post.
+    We log into Bluesky once at the top of the cycle so the account handle
+    gets printed and the daily follower report can run even on cycles where
+    there is no new media to post.
 
-    If the preferred media kind has no unclaimed files waiting, we fall back
-    to the other kind rather than skipping the whole cycle — so an empty
-    image folder doesn't stall posting when videos are available (and vice
-    versa).
+    If the account has been taken down, we raise AccountTakenDownError which
+    the main loop catches to exit the workflow cleanly.
     """
     handle = get_env("BSKY_HANDLE")
     app_pw = get_env("BSKY_APP_PW")
     print_target_account(handle)
     client = Client()
-    client.login(handle, app_pw)
+    try:
+        client.login(handle, app_pw)
+    except Exception as e:
+        err_str = str(e)
+        if "AccountTakedown" in err_str or "AccountSuspended" in err_str:
+            raise AccountTakenDownError(
+                f"Account {handle} has been taken down / suspended."
+            ) from e
+        raise
 
     maybe_generate_daily_follower_report(client, handle)
 
@@ -669,15 +699,17 @@ def run_once():
 
     try:
         post_to_bluesky(client, original_name, local_path, kind, with_link)
-    except Exception:
-        # Posting failed (e.g. transient API error) — give the file back so
-        # it's eligible to be picked up and retried next cycle, rather than
-        # leaving it stuck under a CLAIMED_ name indefinitely.
+    except Exception as e:
+        err_str = str(e)
+        if "AccountTakedown" in err_str or "AccountSuspended" in err_str:
+            release_claim(file["id"], original_name)
+            raise AccountTakenDownError(
+                f"Account {handle} has been taken down / suspended mid-cycle."
+            ) from e
         release_claim(file["id"], original_name)
         raise
 
     move_file(file["id"], restore_name=original_name)
-    # Clean up the local temp copy so disk doesn't fill up over a long-running loop
     try:
         os.remove(local_path)
     except OSError:
@@ -687,14 +719,13 @@ def run_once():
 def main():
     """
     Loop forever, running one post cycle every LOOP_INTERVAL_SECONDS.
-    Each cycle is wrapped in try/except so a single failure (e.g. a transient
-    API error) doesn't kill the whole loop - it just gets logged and retried
-    next cycle.
+    Each cycle is wrapped in try/except so a single transient failure
+    (e.g. a network hiccup) doesn't kill the whole loop.
 
-    The workflow restarts this job periodically (GitHub's 6-hour job hard
-    cap), so this loop doesn't need to run forever on its own — just until
-    GitHub kills it, at which point the next scheduled trigger spins up a
-    fresh run that picks up right where this leaves off.
+    The one exception: AccountTakenDownError exits immediately. There is no
+    point retrying a banned account, and we don't want the scheduled workflow
+    to keep firing every 6 hours on a dead account. The ban is logged to the
+    follower report sheet before exit so there's a permanent record.
     """
     print_config_summary()
     print(f"Starting loop. Posting every {LOOP_INTERVAL_SECONDS} seconds.")
@@ -702,6 +733,17 @@ def main():
         cycle_start = time.time()
         try:
             run_once()
+        except AccountTakenDownError as e:
+            handle = get_env("BSKY_HANDLE", required=False) or "unknown"
+            print(f"\n{'='*60}")
+            print(f"ACCOUNT TAKEN DOWN / BANNED: {e}")
+            print(f"Logging ban to report sheet and stopping workflow.")
+            print(f"{'='*60}\n")
+            log_account_ban_to_sheet(handle)
+            # Exit with a non-zero code so GitHub Actions marks the job as
+            # failed — this prevents the next scheduled trigger from re-running
+            # (GitHub stops retrying workflows that consistently fail).
+            sys.exit(1)
         except Exception as e:
             print(f"Error during cycle: {e}")
 
