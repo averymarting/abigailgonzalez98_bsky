@@ -47,7 +47,9 @@ concurrency:
 jobs:
   post:
     runs-on: ubuntu-latest
-    timeout-minutes: 355   # just under GitHub's 360-minute hard cap per job
+    timeout-minutes: 355
+    permissions:
+      actions: write   # needed so the ban-detect step can disable this workflow
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v4
@@ -64,14 +66,20 @@ jobs:
           GOOGLE_OAUTH_CREDENTIALS: ${{ secrets.GOOGLE_OAUTH_CREDENTIALS }}
           UPLOAD_FOLDER_ID: ${{ secrets.UPLOAD_FOLDER_ID }}
           PROCESSED_FOLDER_ID: ${{ secrets.PROCESSED_FOLDER_ID }}
-          # ── Settings: manual input > repo Variable > YOUR config below ──
-          # The values at the end of each line (after the last ||) are YOUR
-          # saved config — scheduled runs use these automatically.
-          # To change permanently: edit these values directly in this file.
-          # To override for just one run: use the workflow_dispatch inputs.
           CAPTION_SHEET_NAME: ${{ github.event.inputs.caption_sheet_name || vars.CAPTION_SHEET_NAME || 'assian' }}
           IMAGE_RATIO: ${{ github.event.inputs.image_ratio || vars.IMAGE_RATIO || '60' }}
           VIDEO_RATIO: ${{ github.event.inputs.video_ratio || vars.VIDEO_RATIO || '40' }}
           NO_LINK_RATIO: ${{ github.event.inputs.no_link_ratio || vars.NO_LINK_RATIO || '20' }}
           HASHTAGS_ENABLED_IMAGE: ${{ github.event.inputs.hashtags_enabled_image || vars.HASHTAGS_ENABLED_IMAGE || 'true' }}
           HASHTAGS_ENABLED_VIDEO: ${{ github.event.inputs.hashtags_enabled_video || vars.HASHTAGS_ENABLED_VIDEO || 'false' }}
+
+      # When the script exits with code 1 (account banned/taken down), this
+      # step disables the workflow schedule so it stops firing automatically.
+      # Requires the workflow to have "Actions: write" permission (added above).
+      - name: Disable workflow schedule on account ban
+        if: failure()
+        run: |
+          echo "Job failed — disabling workflow schedule to stop future runs on banned account."
+          gh workflow disable "${{ github.workflow }}"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
